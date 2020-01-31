@@ -143,6 +143,9 @@ struct kpatch_process {
 	/* List of free VMA areas */
 	struct list_head vmaholes;
 
+	/* List of libc offsets common to all processes */
+	struct list_head *libc_offsets;
+
 	/* libc's base address to use as a worksheet */
 	unsigned long libc_base;
 
@@ -158,6 +161,9 @@ struct kpatch_process {
 	/* Is it an ld-linux trampoline? */
 	unsigned int is_ld_linux:1;
 };
+
+int
+kpatch_find_libc_offsets(int pid, void *_data);
 
 void
 kpatch_object_dump(struct object_file *o);

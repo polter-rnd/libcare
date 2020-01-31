@@ -45,13 +45,26 @@ static int
 processes_patch(kpatch_storage_t *storage,
 		int pid, int is_just_started, int send_fd)
 {
+	int ret;
+	struct vm_hole *hole, *tmp;
 	struct patch_data data = {
 		.storage = storage,
 		.is_just_started = is_just_started,
 		.send_fd = send_fd,
 	};
 
-	return processes_do(pid, process_patch, &data);
+	list_init(&data.libc_offsets);
+	ret = processes_do(-1, kpatch_find_libc_offsets, &data);
+
+	if (ret != -1)
+		ret = processes_do(pid, process_patch, &data);
+
+	list_for_each_entry_safe(hole, tmp, &data.libc_offsets, list) {
+		list_del(&hole->list);
+		free(hole);
+	}
+
+	return ret;
 }
 
 /* Check if system is suitable */

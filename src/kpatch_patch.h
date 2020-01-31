@@ -5,6 +5,7 @@
 #include "kpatch_storage.h"
 #include "kpatch_file.h"
 #include "rbtree.h"
+#include "list.h"
 
 enum {
 	ACTION_APPLY_PATCH,
@@ -15,6 +16,7 @@ struct patch_data {
 	kpatch_storage_t *storage;
 	int is_just_started;
 	int send_fd;
+	struct list_head libc_offsets;
 };
 
 struct unpatch_data {

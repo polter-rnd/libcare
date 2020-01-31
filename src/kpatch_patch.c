@@ -503,6 +503,8 @@ int process_patch(int pid, void *_data)
 		goto out;
 	}
 
+	proc->libc_offsets = &data->libc_offsets;
+
 	kpatch_process_print_short(proc);
 
 	ret = kpatch_process_mem_open(proc, MEM_READ);

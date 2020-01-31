@@ -6,6 +6,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <regex.h>
+#include <stddef.h>
 #include <sys/fcntl.h>
 #include <sys/mman.h>
 #include <sys/vfs.h>
@@ -27,6 +28,7 @@
 #include "kpatch_file.h"
 #include "kpatch_common.h"
 #include "kpatch_elf.h"
+#include "kpatch_patch.h"
 #include "kpatch_ptrace.h"
 #include "list.h"
 #include "kpatch_log.h"
@@ -359,7 +361,7 @@ perms2prot(char *perms)
 }
 
 static struct vm_hole *
-process_add_vm_hole(kpatch_process_t *proc,
+add_vm_hole(struct list_head *vmaholes,
 		    unsigned long hole_start,
 		    unsigned long hole_end)
 {
@@ -372,7 +374,7 @@ process_add_vm_hole(kpatch_process_t *proc,
 	hole->start = hole_start;
 	hole->end = hole_end;
 
-	list_add(&hole->list, &proc->vmaholes);
+	list_add(&hole->list, vmaholes);
 
 	return hole;
 }
@@ -412,13 +414,176 @@ kpatch_process_associate_patches(kpatch_process_t *proc)
 	return found;
 }
 
+static void
+kpatch_clear_holes(struct list_head *vmaholes)
+{
+	struct vm_hole *hole, *tmp;
+	list_for_each_entry_safe(hole, tmp, vmaholes, list) {
+		list_del(&hole->list);
+		free(hole);
+	}
+	list_init(vmaholes);
+}
+
+static int
+kpatch_merge_holes(struct list_head *vmaholes, struct list_head *vmaholes_pid)
+{
+	struct list_head vmaholes_tmp;
+	struct vm_hole *hole, *tmp;
+
+	/* Initialize temporary result list */
+	list_init(&vmaholes_tmp);
+
+	/* Merge lists and write result to temporary list */
+	hole = list_entry(vmaholes->next, struct vm_hole, list),
+	tmp = list_entry(vmaholes_pid->next, struct vm_hole, list);
+	while (&hole->list != vmaholes && &tmp->list != vmaholes_pid) {
+		long lo = (long) hole->start > (long) tmp->start ? hole->start : tmp->start;
+		long hi = (long) hole->end < (long) tmp->end ? hole->end : tmp->end;
+
+		if (lo < hi && !add_vm_hole(&vmaholes_tmp, lo, hi)) {
+			kperr("unable to allocate vm_hole\n");
+			goto error;
+		}
+
+		if ((long) hole->end < (long) tmp->end)
+			hole = list_entry(hole->list.next, struct vm_hole, list);
+		else
+			tmp = list_entry(tmp->list.next, struct vm_hole, list);
+	}
+
+	/* Free old list */
+	kpatch_clear_holes(vmaholes);
+
+	/* Swap temporary list and original */
+	if (!list_empty(&vmaholes_tmp)) {
+		list_first_entry(&vmaholes_tmp, struct vm_hole, list)
+			->list.prev = vmaholes;
+		list_last_entry(&vmaholes_tmp, struct vm_hole, list)
+			->list.next = vmaholes;
+		*vmaholes = vmaholes_tmp;
+	}
+
+	return 0;
+
+error:
+	/* Free temporary list in case of error */
+	kpatch_clear_holes(&vmaholes_tmp);
+	return -1;
+}
+
+int
+kpatch_find_libc_offsets(int pid, void *_data)
+{
+	int ret = 0;
+	struct patch_data *data = _data;
+	struct list_head *vmaholes = &data->libc_offsets;
+	struct list_head vmaholes_pid;
+
+	struct list_head *holes;
+	unsigned long hole_start;
+	unsigned long libc_base = (unsigned long) -1;
+
+	const unsigned long max_distance = 0x80000000;
+
+	FILE *f;
+	char path[128], line[1024];
+
+	/* Open process maps */
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	f = fopen(path, "r");
+	if (f == NULL) {
+		kperr("unable to fopen %s\n", path);
+		return -1;
+	}
+
+	/* Find libc offset */
+	do {
+		unsigned long start, end, offset;
+		unsigned int maj, min, inode;
+		char perms[5], name_[256], *name = name_;
+		int r;
+
+		if (!fgets(line, sizeof(line), f))
+			break;
+		r = sscanf(line, "%lx-%lx %s %lx %x:%x %d %255s",
+			&start, &end, perms, &offset,
+			&maj, &min, &inode, name_);
+		if (r == 8 && !strncmp(basename(name), "libc", 4)
+			&& perms2prot(perms) & PROT_EXEC) {
+			libc_base = start;
+			break;
+		}
+	} while (1);
+
+	if (libc_base == (unsigned long) -1) {
+		kperr("Can't find libc_base required for manipulations: %d\n", pid);
+		fclose(f);
+		return -1;
+	}
+
+	list_init(&vmaholes_pid);
+	holes = list_empty(vmaholes) ? vmaholes : &vmaholes_pid;
+	hole_start = 0;
+
+	/* Find acceptable offset intervals */
+	rewind(f);
+	do {
+		unsigned long start, end;
+		long offset_start, offset_end;
+
+		if (!fgets(line, sizeof(line), f))
+			break;
+
+		sscanf(line, "%lx-%lx", &start, &end);
+
+		/* Calculate offset from libc */
+		offset_start = hole_start - libc_base;
+		offset_end = start - libc_base;
+
+		/* Hole must lay no further that 2GiB */
+		if (labs(offset_start) < max_distance &&
+		    labs(offset_end - offset_start) > 2 * PAGE_SIZE) {
+			if (labs(offset_end) > max_distance) {
+				offset_end = ((offset_end > 0) - (offset_end < 0))
+							 * max_distance;
+			}
+
+			if (!add_vm_hole(holes, offset_start, offset_end)) {
+				kperr("unable to allocate vm_hole\n");
+				ret = -1;
+				break;
+			}
+		}
+		hole_start = end;
+	} while (1);
+	fclose(f);
+
+	/* Merge offset intervals */
+	if (!list_empty(&vmaholes_pid)) {
+		if (ret != -1) {
+			ret = kpatch_merge_holes(vmaholes, &vmaholes_pid);
+		}
+
+		kpatch_clear_holes(&vmaholes_pid);
+	}
+
+	return ret;
+}
+
 int
 kpatch_process_parse_proc_maps(kpatch_process_t *proc)
 {
 	FILE *f;
-	int ret, fd, is_libc_base_set = 0;
-	unsigned long hole_start = 0;
-	struct vm_hole *hole = NULL;
+	int r, fd, is_libc_base_set = 0;
+	struct vm_hole *hole;
+	unsigned long hole_start;
+	int common_holes_found;
+
+	unsigned long start, end, offset;
+	unsigned int maj, min, inode;
+	char perms[5], name_[256];
+	char line[1024];
 
 	/*
 	 * 1. Create the list of all objects in the process
@@ -442,12 +607,52 @@ kpatch_process_parse_proc_maps(kpatch_process_t *proc)
 	}
 
 	do {
+		char *name = name_;
+
+		if (!fgets(line, sizeof(line), f))
+			break;
+		r = sscanf(line, "%lx-%lx %s %lx %x:%x %d %255s",
+			&start, &end, perms, &offset,
+			&maj, &min, &inode, name_);
+
+		if (r == 8 && !strncmp(basename(name), "libc", 4)
+			&& perms2prot(perms) & PROT_EXEC) {
+			proc->libc_base = start;
+			is_libc_base_set = 1;
+			break;
+		}
+	} while (1);
+
+	if (!is_libc_base_set) {
+		kperr("Can't find libc_base required for manipulations: %d\n",
+		      proc->pid);
+		fclose(f);
+		return -1;
+	}
+
+	/* Fill process vm holes */
+	list_for_each_entry(hole, proc->libc_offsets, list) {
+		/* Convert libc offsets to addresses */
+		unsigned long hole_start =
+			proc->libc_base + (long) hole->start + PAGE_SIZE;
+		unsigned long hole_end =
+			proc->libc_base + (long) hole->end - PAGE_SIZE;
+
+		/* Hole must be at least 2 pages for guardians */
+		if (hole_end - hole_start > 2 * PAGE_SIZE
+		    && !add_vm_hole(&proc->vmaholes, hole_start, hole_end)) {
+			kperr("unable to allocate vm_hole\n");
+			goto error;
+		}
+	}
+
+	common_holes_found = !list_empty(&proc->vmaholes);
+	hole_start = 0;
+	rewind(f);
+
+	do {
 		struct vm_area vma;
-		char line[1024];
-		unsigned long start, end, offset;
-		unsigned int maj, min, inode;
-		char perms[5], name_[256], *name = name_;
-		int r;
+		char *name = name_;
 
 		if (!fgets(line, sizeof(line), f))
 			break;
@@ -462,39 +667,43 @@ kpatch_process_parse_proc_maps(kpatch_process_t *proc)
 		vma.offset = offset;
 		vma.prot = perms2prot(perms);
 
-
-		/* Hole must be at least 2 pages for guardians */
-		if (start - hole_start > 2 * PAGE_SIZE) {
-			hole = process_add_vm_hole(proc,
-						   hole_start + PAGE_SIZE,
-						   start - PAGE_SIZE);
-			if (hole == NULL)
-				goto error;
+		if (common_holes_found) {
+			/* Find last common hole for this object */
+			hole = list_first_entry(&proc->vmaholes, struct vm_hole, list);
+			if (hole->end > start) {
+				/* If first hole is on the right from object */
+				hole = NULL;
+			} else {
+				while (&hole->list != &proc->vmaholes) {
+					hole = list_next_entry(hole, list);
+					if (hole->end > start) {
+						hole = list_prev_entry(hole, list);
+						break;
+					}
+				}
+			}
+		} else {
+			/* Hole must be at least 2 pages for guardians */
+			if (start - hole_start > 2 * PAGE_SIZE) {
+				hole = add_vm_hole(&proc->vmaholes,
+				                   hole_start + PAGE_SIZE,
+								   start - PAGE_SIZE);
+				if (hole == NULL) {
+					kperr("unable to allocate vm_hole\n");
+					goto error;
+				}
+			}
+			hole_start = end;
 		}
-		hole_start = end;
 
 		name = name[0] == '/' ? basename(name) : name;
 
-		ret = process_add_object_vma(proc, makedev(maj, min),
+		r = process_add_object_vma(proc, makedev(maj, min),
 					     inode, name, &vma, hole);
-		if (ret < 0)
+		if (r < 0)
 			goto error;
-
-		if (!is_libc_base_set &&
-		    !strncmp(basename(name), "libc", 4) &&
-		    vma.prot & PROT_EXEC) {
-			proc->libc_base = start;
-			is_libc_base_set = 1;
-		}
-
 	} while (1);
 	fclose(f);
-
-	if (!is_libc_base_set) {
-		kperr("Can't find libc_base required for manipulations: %d\n",
-		      proc->pid);
-		return -1;
-	}
 
 	kpinfo("Found %d object file(s).\n", proc->num_objs);
 
@@ -1094,8 +1303,8 @@ kpatch_object_allocate_patch(struct object_file *o,
 				  PROT_READ | PROT_WRITE | PROT_EXEC,
 				  MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (addr == 0) {
-		kplogerror("remote alloc of 0x%lx bytes failed\n",
-			   addr);
+		kplogerror("remote alloc of %lu bytes at 0x%lx failed\n",
+			   sz, addr);
 		return -1;
 	}
 
